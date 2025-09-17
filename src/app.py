@@ -1,6 +1,7 @@
 import tkinter as tk
 import threading
 import time
+import math
 from typing import Dict, Tuple, Optional
 
 try:
@@ -17,6 +18,10 @@ GRIP_THRESHOLD = 0.30
 THUMBTOUCH_THRESHOLD = 0.01
 ARROW_FLIP_SIGN = -1.0
 POLL_INTERVAL = 0.03
+
+# base station
+BASESTATION_FOV_DEG = 120   # degrees
+BASESTATION_RANGE_M = 6.0   # meters
 
 # ---------- exceptions ----------
 class SteamVRNotRunningError(RuntimeError):
@@ -39,21 +44,18 @@ def detect_fingers_approx(state) -> list[str]:
     fingers = []
     axes = list(getattr(state, "rAxis", []))
 
-    # index
     trigger_val = axis_value_safe(axes[1]) if len(axes) > 1 else 0.0
     trigger_pressed = bool(getattr(state, "ulButtonPressed", 0) & openvr.ButtonMask.Trigger)
     trigger_touched = bool(getattr(state, "ulButtonTouched", 0) & openvr.ButtonMask.Trigger)
     if trigger_val >= TRIGGER_THRESHOLD or trigger_pressed or trigger_touched:
         fingers.append("Index Finger")
 
-    # thumb
     thumb = bool(getattr(state, "ulButtonTouched", 0) & openvr.ButtonMask.Touchpad)
     if not thumb and axes:
         thumb = abs(axis_value_safe(axes[0])) > THUMBTOUCH_THRESHOLD
     if thumb:
         fingers.append("Thumb")
 
-    # middle/ring/pinky
     mapped = False
     finger_names = ["Middle Finger", "Ring Finger", "Pinky Finger"]
     for idx, name in zip([2, 3, 4], finger_names):
@@ -66,7 +68,6 @@ def detect_fingers_approx(state) -> list[str]:
         if grip_val >= GRIP_THRESHOLD or grip_pressed:
             fingers.extend(finger_names)
 
-    # dedupe
     seen, out = set(), []
     for f in fingers:
         if f not in seen:
@@ -92,6 +93,14 @@ def arrow_delta_from_forward(forward, length_m=ARROW_LENGTH_M, scale=METERS_TO_P
     dx = fx * length_m * scale
     dy = -fz * length_m * scale
     return dx, dy
+
+def yaw_from_matrix(m) -> float:
+    try:
+        fwd_x = float(m[0][2])
+        fwd_z = float(m[2][2])
+        return math.atan2(-fwd_z, fwd_x)
+    except Exception:
+        return 0.0
 
 # ---------- backend ----------
 class VRBackend:
@@ -171,10 +180,10 @@ class VRBackend:
 
                     forward = forward_from_matrix(m)
                     self.devices[idx] = {"x": x, "y": y, "z": z,
-                                         "class": device_class, "role": role, "forward": forward}
+                                         "class": device_class, "role": role,
+                                         "forward": forward, "matrix": m}
                     present.add(idx)
 
-                    # controller state
                     if device_class == openvr.TrackedDeviceClass_Controller:
                         state = None
                         try:
@@ -217,26 +226,26 @@ class VRBackend:
                     "left_fingers": self.left_fingers,
                     "right_fingers": self.right_fingers}
 
-
 # ---------- gui ----------
 class VRGui:
     def __init__(self, root: tk.Tk, backend: VRBackend):
         self.root, self.backend = root, backend
         self.root.title("SteamVR External App Tracking Proof of Concept")
 
-        # toggles
         self.show_grid = tk.BooleanVar(master=root, value=True)
         self.show_labels = tk.BooleanVar(master=root, value=True)
         self.show_height = tk.BooleanVar(master=root, value=True)
         self.show_fingers = tk.BooleanVar(master=root, value=True)
         self.show_arrows = tk.BooleanVar(master=root, value=True)
+        self.show_fovs = tk.BooleanVar(master=root, value=True)
         self.show_debug = tk.BooleanVar(master=root, value=False)
 
         menubar = tk.Menu(root)
         view = tk.Menu(menubar, tearoff=0)
         for lbl, var in [("Grid", self.show_grid), ("Labels", self.show_labels),
                          ("Height", self.show_height), ("Fingers", self.show_fingers),
-                         ("Arrows", self.show_arrows), ("Debug", self.show_debug)]:
+                         ("Arrows", self.show_arrows), ("FOVs", self.show_fovs),
+                         ("Debug", self.show_debug)]:
             view.add_checkbutton(label=f"Show {lbl}", variable=var)
         menubar.add_cascade(label="View", menu=view)
         root.config(menu=menubar)
@@ -248,7 +257,6 @@ class VRGui:
         self._running = True
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # persistent grid
         self._draw_grid()
         self.root.bind("<Configure>", lambda e: self._draw_grid(force=True))
 
@@ -269,7 +277,10 @@ class VRGui:
             self.canvas.create_line(0, gy, w, gy, fill="#171a1c", tags="__grid__")
         self.canvas.create_oval(w/2 - 6, h/2 - 6, w/2 + 6, h/2 + 6,
                                 fill="#9ccf8a", outline="", tags="__grid__")
-        self.canvas.tag_lower("__grid__")
+        try:
+            self.canvas.tag_lower("__grid__")
+        except Exception:
+            pass
 
     def _ensure_items_for(self, idx: int):
         if idx in self.canvas_items:
@@ -286,6 +297,7 @@ class VRGui:
         if items:
             for k in items.values():
                 self.canvas.delete(k)
+        self.canvas.delete(f"fov_{idx}")
 
     def _tick(self):
         try:
@@ -302,6 +314,49 @@ class VRGui:
         w, h = max(200, self.canvas.winfo_width()), max(200, self.canvas.winfo_height())
         self._draw_grid()
 
+        self.canvas.delete("__fovs__")
+        if self.show_fovs.get():
+            for idx, info in devices.items():
+                if info.get("class") != openvr.TrackedDeviceClass_TrackingReference:
+                    continue
+                x, y, z = info["x"], info["y"], info["z"]
+                sx, sy = w/2 + x * METERS_TO_PIXELS, h/2 - z * METERS_TO_PIXELS
+                m = info.get("matrix")
+                if m is not None:
+                    yaw_rad = yaw_from_matrix(m)
+                    yaw_rad += math.pi
+                else:
+                    fx, _, fz = info.get("forward", (0.0, 0.0, 1.0))
+                    yaw_rad = math.atan2(-fz, fx)
+
+                half = math.radians(BASESTATION_FOV_DEG) / 2.0
+                range_px = BASESTATION_RANGE_M * METERS_TO_PIXELS
+                left_angle = yaw_rad - half
+                right_angle = yaw_rad + half
+                lx = sx + range_px * math.cos(left_angle)
+                ly = sy + range_px * math.sin(left_angle)
+                rx = sx + range_px * math.cos(right_angle)
+                ry = sy + range_px * math.sin(right_angle)
+
+                try:
+                    self.canvas.create_polygon(
+                        sx, sy, lx, ly, rx, ry,
+                        fill="#1a1c20", outline="#1a1c20", stipple="gray75",
+                        tags=(f"fov_{idx}", "__fovs__")
+                    )
+                except tk.TclError:
+                    self.canvas.create_polygon(
+                        sx, sy, lx, ly, rx, ry,
+                        fill="#cfefcf", outline="#55ff55",
+                        tags=(f"fov_{idx}", "__fovs__")
+                    )
+
+        try:
+            self.canvas.tag_lower("__grid__")
+            self.canvas.tag_lower("__fovs__")
+        except Exception:
+            pass
+
         present = set()
         for idx, info in devices.items():
             self._ensure_items_for(idx)
@@ -312,7 +367,6 @@ class VRGui:
             forward = info.get("forward", (0.0, 0.0, 1.0))
             sx, sy = w/2 + x * METERS_TO_PIXELS, h/2 - z * METERS_TO_PIXELS
 
-            # color + label
             if dev_class == openvr.TrackedDeviceClass_HMD:
                 fill, txt, size = "#ff5555", "HMD", 12
             elif dev_class == openvr.TrackedDeviceClass_Controller:
@@ -350,7 +404,9 @@ class VRGui:
             if old not in present:
                 self._remove_items_for(old)
 
-        # fingers overlay
+        if not self.show_fovs.get():
+            self.canvas.delete("__fovs__")
+
         self.canvas.delete("__fingers__")
         if self.show_fingers.get():
             self.canvas.create_text(w-12, 12, anchor="ne",
@@ -362,7 +418,6 @@ class VRGui:
                                     fill="#cce", font=("Segoe UI", 10),
                                     tags="__fingers__")
 
-        # debug overlay
         self.canvas.delete("__debug__")
         if self.show_debug.get():
             lines = ["DEBUG: raw controller states"]
@@ -371,7 +426,6 @@ class VRGui:
                 axes_str = ", ".join(f"{a[0]:.2f}" for a in rs.get("axes", [])[:5])
                 lines.append(f"Device {di}: axes[{axes_str}] pressed={rs.get('pressed',0)} touched={rs.get('touched',0)}")
             if lines:
-                # background rect
                 rect_h = 14 * len(lines)
                 self.canvas.create_rectangle(5, h-rect_h-5, 400, h-5, fill="#000000", outline="", tags="__debug__")
             for i, ln in enumerate(reversed(lines)):
@@ -393,7 +447,7 @@ def main():
     except SteamVRNotRunningError as e:
         root = tk.Tk()
         root.title("SteamVR External App Tracking Proof of Concept")
-        tk.Label(root, text=str(e), fg="red").pack(padx=20, pady=20)
+        tk.Label(root, text=str(e), fg="red").pack(padx=10, pady=10)
         root.mainloop()
         return
 
@@ -401,7 +455,6 @@ def main():
     root = tk.Tk()
     VRGui(root, backend)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
